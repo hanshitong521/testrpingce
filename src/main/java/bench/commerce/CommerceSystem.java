@@ -23,7 +23,9 @@ public final class CommerceSystem {
     }
 
     public void addStock(String sku, int quantity) {
-        inventory.addStock(sku, quantity);
+        synchronized (store.mutex) {
+            inventory.addStock(sku, quantity);
+        }
     }
 
     public int availableStock(String sku) {
@@ -39,7 +41,9 @@ public final class CommerceSystem {
     }
 
     public void addCoupon(String code, long discountCents) {
-        coupons.addCoupon(code, discountCents);
+        synchronized (store.mutex) {
+            coupons.addCoupon(code, discountCents);
+        }
     }
 
     public CouponStatus couponStatus(String code) {
@@ -47,11 +51,15 @@ public final class CommerceSystem {
     }
 
     public OrderView createOrder(String orderId, List<OrderItem> items, String couponCode, long ttlMillis) {
-        return orders.create(orderId, items, couponCode, ttlMillis);
+        synchronized (store.mutex) {
+            return orders.create(orderId, items, couponCode, ttlMillis);
+        }
     }
 
     public boolean cancelOrder(String orderId) {
-        return orders.cancel(orderId);
+        synchronized (store.mutex) {
+            return orders.cancel(orderId);
+        }
     }
 
     public CallbackResult paymentSucceeded(String paymentId, String orderId, long amountCents) {
@@ -59,7 +67,9 @@ public final class CommerceSystem {
     }
 
     public int expireDueOrders() {
-        return expiration.run();
+        synchronized (store.mutex) {
+            return expiration.run();
+        }
     }
 
     public RefundResult refund(String refundId, String orderId, long amountCents) {

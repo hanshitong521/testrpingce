@@ -13,4 +13,17 @@ final class PaymentRecord {
         this.amount = amount;
         this.status = status;
     }
+
+    boolean sameRequest(String orderId, long amount) {
+        return this.orderId.equals(orderId) && this.amount == amount;
+    }
+
+    boolean refundable() {
+        return status == PaymentStatus.CAPTURED || status == PaymentStatus.PARTIALLY_REFUNDED;
+    }
+
+    void applyRefund(long amountCents) {
+        refunded += amountCents;
+        status = refunded >= amount ? PaymentStatus.REFUNDED : PaymentStatus.PARTIALLY_REFUNDED;
+    }
 }

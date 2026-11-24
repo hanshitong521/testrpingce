@@ -13,34 +13,51 @@ final class RefundService {
         if (refundId == null || refundId.isBlank() || orderId == null || orderId.isBlank() || amountCents <= 0) {
             return new RefundResult(false, false, "invalid_request", 0);
         }
-        Order order = orders.get(orderId);
-        if (order == null || (order.status != OrderStatus.PAID
-                && order.status != OrderStatus.PARTIALLY_REFUNDED)) {
-            return new RefundResult(false, false, "order_not_refundable", order == null ? 0 : order.refunded);
+        synchronized (store.mutex) {
+            return applyUnderLock(refundId, orderId, amountCents);
         }
+    }
+
+    private RefundResult applyUnderLock(String refundId, String orderId, long amountCents) {
         RefundRecord previous = store.refunds.get(refundId);
         if (previous != null) {
-            if (!previous.orderId.equals(orderId) || previous.amount != amountCents) {
-                return new RefundResult(false, false, "refund_id_conflict", order.refunded);
-            }
-            // Replayed requests used to be treated as another financial operation.
-        } else {
-            store.refunds.put(refundId, new RefundRecord(refundId, orderId, amountCents));
+            return previous.sameRequest(orderId, amountCents)
+                    ? new RefundResult(true, true, "accepted", refundedFor(orderId))
+                    : new RefundResult(false, false, "refund_id_conflict", refundedFor(orderId));
         }
-        if (amountCents > order.paid) {
+        Order order = orders.get(orderId);
+        if (order == null || !order.paidOrRefunded() || order.status == OrderStatus.REFUNDED) {
+            return new RefundResult(false, false, "order_not_refundable", order == null ? 0 : order.refunded);
+        }
+        if (amountCents > order.remainingRefundable()) {
+            return new RefundResult(false, false, "amount_exceeds_payment", order.refunded);
+        }
+        PaymentRecord payment = findRefundablePayment(orderId);
+        if (payment == null || amountCents > payment.amount - payment.refunded) {
             return new RefundResult(false, false, "amount_exceeds_payment", order.refunded);
         }
         order.refunded += amountCents;
-        order.status = order.refunded >= order.paid ? OrderStatus.REFUNDED : OrderStatus.PARTIALLY_REFUNDED;
+        order.status = order.remainingRefundable() == 0
+                ? OrderStatus.REFUNDED
+                : OrderStatus.PARTIALLY_REFUNDED;
+        payment.applyRefund(amountCents);
+        store.refunds.put(refundId, new RefundRecord(refundId, orderId, amountCents));
+        store.event(EventTypes.REFUND_SUCCEEDED, orderId, refundId, amountCents);
+        return new RefundResult(true, false, "accepted", order.refunded);
+    }
+
+    private PaymentRecord findRefundablePayment(String orderId) {
         for (PaymentRecord payment : store.payments.values()) {
-            if (payment.orderId.equals(orderId)) {
-                payment.refunded += amountCents;
-                payment.status = payment.refunded >= payment.amount
-                        ? PaymentStatus.REFUNDED : PaymentStatus.PARTIALLY_REFUNDED;
-                break;
+            if (payment.orderId.equals(orderId) && payment.refundable()
+                    && payment.amount > payment.refunded) {
+                return payment;
             }
         }
-        store.event("REFUND_SUCCEEDED", orderId, refundId, amountCents);
-        return new RefundResult(true, previous != null, "accepted", order.refunded);
+        return null;
+    }
+
+    private long refundedFor(String orderId) {
+        Order order = orders.get(orderId);
+        return order == null ? 0 : order.refunded;
     }
 }

@@ -13,26 +13,39 @@ final class PaymentService {
         if (paymentId == null || paymentId.isBlank() || orderId == null || orderId.isBlank() || amountCents <= 0) {
             return CallbackResult.REJECTED;
         }
-        PaymentRecord previous = store.payments.get(paymentId);
-        if (previous != null && (!previous.orderId.equals(orderId) || previous.amount != amountCents)) {
-            return CallbackResult.CONFLICT;
+        synchronized (store.mutex) {
+            return applyUnderLock(paymentId, orderId, amountCents);
         }
-        if (previous == null) {
-            store.payments.put(paymentId,
-                    new PaymentRecord(paymentId, orderId, amountCents, PaymentStatus.CAPTURED));
+    }
+
+    private CallbackResult applyUnderLock(String paymentId, String orderId, long amountCents) {
+        PaymentRecord tracked = store.payments.get(paymentId);
+        if (tracked != null) {
+            return tracked.sameRequest(orderId, amountCents)
+                    ? CallbackResult.DUPLICATE
+                    : CallbackResult.CONFLICT;
         }
-        // The gateway retries callbacks; this path historically replays the business transition too.
         Order order = orders.get(orderId);
-        if (order == null) {
+        if (order == null || amountCents != order.payable) {
             return CallbackResult.REJECTED;
         }
-        if (orders.markPaid(orderId, amountCents, paymentId)) {
-            return CallbackResult.ACCEPTED;
+        if (order.pendingPayment()) {
+            orders.markPaymentCapturePending(orderId, paymentId);
         }
-        if (order.status == OrderStatus.PAID || order.status == OrderStatus.PARTIALLY_REFUNDED
-                || order.status == OrderStatus.REFUNDED) {
+        PaymentApplication application = orders.applyPayment(paymentId, orderId, amountCents);
+        if (application == PaymentApplication.REJECTED) {
+            orders.clearPaymentCapture(orderId, paymentId);
+            return CallbackResult.REJECTED;
+        }
+        PaymentStatus status = application == PaymentApplication.ACCEPTED
+                ? PaymentStatus.CAPTURED
+                : PaymentStatus.REFUND_REQUIRED;
+        store.payments.put(paymentId,
+                new PaymentRecord(paymentId, orderId, amountCents, status));
+        if (application == PaymentApplication.REFUND_REQUIRED) {
+            store.event(EventTypes.PAYMENT_REFUND_REQUIRED, orderId, paymentId, amountCents);
             return CallbackResult.REFUND_REQUIRED;
         }
-        return CallbackResult.REJECTED;
+        return CallbackResult.ACCEPTED;
     }
 }

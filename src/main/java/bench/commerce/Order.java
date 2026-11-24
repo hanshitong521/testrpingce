@@ -15,6 +15,7 @@ final class Order {
     OrderStatus status = OrderStatus.PENDING_PAYMENT;
     long paid;
     long refunded;
+    String capturingPaymentId;
 
     Order(String id, List<OrderItem> items, long subtotal, long discount, String couponCode,
           long createdAt, long expiresAt) {
@@ -31,5 +32,19 @@ final class Order {
     OrderView view() {
         return new OrderView(id, items, subtotal, discount, payable, couponCode, status,
                 paid, refunded, createdAt, expiresAt);
+    }
+
+    boolean pendingPayment() {
+        return status == OrderStatus.PENDING_PAYMENT;
+    }
+
+    boolean paidOrRefunded() {
+        return status == OrderStatus.PAID
+                || status == OrderStatus.PARTIALLY_REFUNDED
+                || status == OrderStatus.REFUNDED;
+    }
+
+    long remainingRefundable() {
+        return paid - refunded;
     }
 }

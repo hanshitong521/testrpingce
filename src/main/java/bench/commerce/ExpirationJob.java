@@ -18,7 +18,7 @@ final class ExpirationJob {
         long now = clock.nowMillis();
         List<String> due = new ArrayList<>();
         for (Order order : store.orders.values()) {
-            if (order.status == OrderStatus.PENDING_PAYMENT && now >= order.expiresAt) {
+            if (order.pendingPayment() && now >= order.expiresAt) {
                 due.add(order.id);
             }
         }

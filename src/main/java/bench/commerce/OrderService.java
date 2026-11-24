@@ -35,38 +35,59 @@ final class OrderService {
         long expiresAt = ttlMillis > Long.MAX_VALUE - now ? Long.MAX_VALUE : now + ttlMillis;
         Order order = new Order(orderId, items, subtotal, discount, couponCode, now, expiresAt);
         store.orders.put(orderId, order);
-        store.event("ORDER_CREATED", orderId, null, order.payable);
+        store.event(EventTypes.ORDER_CREATED, orderId, null, order.payable);
         return order.view();
     }
 
     boolean cancel(String orderId) {
         Order order = store.orders.get(orderId);
-        if (order == null || order.status != OrderStatus.PENDING_PAYMENT) {
+        if (order == null || !order.pendingPayment()) {
             return false;
         }
         inventory.release(orderId);
         coupons.release(order.couponCode, orderId);
         order.status = OrderStatus.CANCELLED;
-        store.event("ORDER_CANCELLED", orderId, null, 0);
+        store.event(EventTypes.ORDER_CANCELLED, orderId, null, 0);
         return true;
     }
 
-    boolean markPaid(String orderId, long amountCents, String paymentId) {
+    PaymentApplication applyPayment(String paymentId, String orderId, long amountCents) {
         Order order = store.orders.get(orderId);
-        if (order == null || order.status == OrderStatus.PAID
-                || order.status == OrderStatus.REFUNDED
-                || order.status == OrderStatus.PARTIALLY_REFUNDED) {
-            return false;
+        if (order == null) {
+            return PaymentApplication.REJECTED;
         }
         if (amountCents != order.payable) {
-            return false;
+            return PaymentApplication.REJECTED;
+        }
+        if (order.paidOrRefunded()) {
+            return PaymentApplication.REFUND_REQUIRED;
+        }
+        if (order.capturingPaymentId != null && !order.capturingPaymentId.equals(paymentId)) {
+            return PaymentApplication.REFUND_REQUIRED;
+        }
+        if (!order.pendingPayment()) {
+            return PaymentApplication.REFUND_REQUIRED;
         }
         inventory.commit(orderId);
         coupons.consume(order.couponCode, orderId);
         order.status = OrderStatus.PAID;
         order.paid = amountCents;
-        store.event("PAYMENT_SUCCEEDED", orderId, paymentId, amountCents);
-        return true;
+        store.event(EventTypes.PAYMENT_SUCCEEDED, orderId, paymentId, amountCents);
+        return PaymentApplication.ACCEPTED;
+    }
+
+    void markPaymentCapturePending(String orderId, String paymentId) {
+        Order order = store.orders.get(orderId);
+        if (order != null) {
+            order.capturingPaymentId = paymentId;
+        }
+    }
+
+    void clearPaymentCapture(String orderId, String paymentId) {
+        Order order = store.orders.get(orderId);
+        if (order != null && paymentId.equals(order.capturingPaymentId)) {
+            order.capturingPaymentId = null;
+        }
     }
 
     Order get(String orderId) {

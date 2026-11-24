@@ -5,5 +5,5 @@ import java.util.Map;
 
 final class Reservation {
     final Map<String, Integer> quantities = new LinkedHashMap<>();
-    String state = "RESERVED";
+    ReservationState state = ReservationState.RESERVED;
 }
