@@ -1,6 +1,11 @@
 package bench.commerce;
 
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 public final class CommerceTest {
     private static int passed;
@@ -14,6 +19,14 @@ public final class CommerceTest {
         run("refundReplayAndCumulativeLimit", CommerceTest::refundReplayAndCumulativeLimit);
         run("expirationCancelsOnlyDueOrders", CommerceTest::expirationCancelsOnlyDueOrders);
         run("failedCreationMustNotStrandCoupon", CommerceTest::failedCreationMustNotStrandCoupon);
+        run("paymentAmountMismatchDoesNotReservePaymentId", CommerceTest::paymentAmountMismatchDoesNotReservePaymentId);
+        run("paymentIdReuseAcrossOrdersIsConflict", CommerceTest::paymentIdReuseAcrossOrdersIsConflict);
+        run("expiredOrderLatePaymentRequiresRefund", CommerceTest::expiredOrderLatePaymentRequiresRefund);
+        run("duplicateCallbackAfterPartialRefundIsCompensated", CommerceTest::duplicateCallbackAfterPartialRefundIsCompensated);
+        run("fullRefundDoesNotRestockOrReleaseCoupon", CommerceTest::fullRefundDoesNotRestockOrReleaseCoupon);
+        run("refundIdReuseIsConflictWithoutSideEffects", CommerceTest::refundIdReuseIsConflictWithoutSideEffects);
+        run("repeatedExpirationReleasesInventoryOnce", CommerceTest::repeatedExpirationReleasesInventoryOnce);
+        run("concurrentCallbacksAndExpirationCommitOnce", CommerceTest::concurrentCallbacksAndExpirationCommitOnce);
         System.out.println("RESULT: " + passed + " passed, " + failed + " failed");
         if (failed != 0) {
             throw new AssertionError("visible commerce tests failed: " + failed);
@@ -110,6 +123,140 @@ public final class CommerceTest {
                 List.of(new OrderItem("A", 2, 100)), "ROLLBACK", 100), "insufficient stock");
         eq(CouponStatus.AVAILABLE, app.couponStatus("ROLLBACK"), "coupon reservation rolled back");
         eq(1, app.availableStock("A"), "stock remains unchanged");
+    }
+
+    private static void paymentAmountMismatchDoesNotReservePaymentId() {
+        CommerceSystem app = app(new ManualTime(12_000));
+        app.addStock("A", 1);
+        app.createOrder("O-AMOUNT", List.of(new OrderItem("A", 1, 900)), null, 10_000);
+        eq(CallbackResult.REJECTED, app.paymentSucceeded("P-AMOUNT", "O-AMOUNT", 899), "wrong amount rejected");
+        eq(OrderStatus.PENDING_PAYMENT, app.order("O-AMOUNT").status(), "order unchanged");
+        eq(CallbackResult.ACCEPTED, app.paymentSucceeded("P-AMOUNT", "O-AMOUNT", 900), "same id accepted with valid amount");
+        eq(1, app.soldStock("A"), "stock committed once");
+    }
+
+    private static void paymentIdReuseAcrossOrdersIsConflict() {
+        CommerceSystem app = app(new ManualTime(13_000));
+        app.addStock("A", 2);
+        app.createOrder("O-P1", List.of(new OrderItem("A", 1, 300)), null, 10_000);
+        app.createOrder("O-P2", List.of(new OrderItem("A", 1, 300)), null, 10_000);
+        eq(CallbackResult.ACCEPTED, app.paymentSucceeded("P-SHARED", "O-P1", 300), "first callback accepted");
+        eq(CallbackResult.CONFLICT, app.paymentSucceeded("P-SHARED", "O-P2", 300), "payment id reuse conflict");
+        eq(OrderStatus.PENDING_PAYMENT, app.order("O-P2").status(), "second order unchanged");
+        eq(1, app.soldStock("A"), "inventory unchanged by conflict");
+    }
+
+    private static void expiredOrderLatePaymentRequiresRefund() {
+        ManualTime clock = new ManualTime(14_000);
+        CommerceSystem app = app(clock);
+        app.addStock("A", 1);
+        app.addCoupon("EXP", 50);
+        app.createOrder("O-EXP", List.of(new OrderItem("A", 1, 500)), "EXP", 100);
+        clock.set(14_100);
+        eq(1, app.expireDueOrders(), "order expired");
+        eq(CallbackResult.REFUND_REQUIRED, app.paymentSucceeded("P-EXP", "O-EXP", 450), "late payment compensated");
+        eq(OrderStatus.CANCELLED, app.order("O-EXP").status(), "expired order stays cancelled");
+        eq(1, app.availableStock("A"), "stock stays released");
+        eq(CouponStatus.AVAILABLE, app.couponStatus("EXP"), "coupon stays available");
+        eq(1L, countEvents(app, "PAYMENT_REFUND_REQUIRED"), "refund-required audit event recorded");
+    }
+
+    private static void duplicateCallbackAfterPartialRefundIsCompensated() {
+        CommerceSystem app = app(new ManualTime(15_000));
+        app.addStock("A", 1);
+        app.createOrder("O-PR", List.of(new OrderItem("A", 1, 700)), null, 10_000);
+        app.paymentSucceeded("P-PR", "O-PR", 700);
+        check(app.refund("R-PR", "O-PR", 200).accepted(), "partial refund accepted");
+        eq(CallbackResult.REFUND_REQUIRED, app.paymentSucceeded("P-PR", "O-PR", 700),
+                "callback after refund requires compensation");
+        eq(CallbackResult.REFUND_REQUIRED, app.paymentSucceeded("P-PR", "O-PR", 700),
+                "compensation callback replay stays stable");
+        eq(700L, app.order("O-PR").paidCents(), "paid amount unchanged");
+        eq(200L, app.order("O-PR").refundedCents(), "refund total unchanged");
+        eq(1, app.soldStock("A"), "inventory not changed by duplicate callback");
+        eq(1L, countEvents(app, "PAYMENT_REFUND_REQUIRED"), "one compensation event");
+    }
+
+    private static void fullRefundDoesNotRestockOrReleaseCoupon() {
+        CommerceSystem app = app(new ManualTime(16_000));
+        app.addStock("A", 2);
+        app.addCoupon("FULL", 100);
+        app.createOrder("O-FULL", List.of(new OrderItem("A", 2, 400)), "FULL", 10_000);
+        app.paymentSucceeded("P-FULL", "O-FULL", 700);
+        check(app.refund("R-FULL", "O-FULL", 700).accepted(), "full refund accepted");
+        eq(OrderStatus.REFUNDED, app.order("O-FULL").status(), "order refunded");
+        eq(0, app.availableStock("A"), "refund does not restock");
+        eq(2, app.soldStock("A"), "sold quantity unchanged");
+        eq(CouponStatus.USED, app.couponStatus("FULL"), "used coupon not released");
+    }
+
+    private static void refundIdReuseIsConflictWithoutSideEffects() {
+        CommerceSystem app = app(new ManualTime(17_000));
+        app.addStock("A", 1);
+        app.createOrder("O-RC", List.of(new OrderItem("A", 1, 600)), null, 10_000);
+        app.paymentSucceeded("P-RC", "O-RC", 600);
+        check(app.refund("R-CONFLICT", "O-RC", 200).accepted(), "first refund accepted");
+        RefundResult conflict = app.refund("R-CONFLICT", "O-RC", 300);
+        check(!conflict.accepted() && "refund_id_conflict".equals(conflict.reason()), "conflict reported");
+        eq(200L, app.order("O-RC").refundedCents(), "refund total unchanged");
+        eq(1L, countEvents(app, "REFUND_SUCCEEDED"), "no extra refund event");
+    }
+
+    private static void repeatedExpirationReleasesInventoryOnce() {
+        ManualTime clock = new ManualTime(18_000);
+        CommerceSystem app = app(clock);
+        app.addStock("A", 3);
+        app.createOrder("O-REPEAT", List.of(new OrderItem("A", 2, 100)), null, 100);
+        clock.set(18_100);
+        eq(1, app.expireDueOrders(), "first expiration releases order");
+        eq(0, app.expireDueOrders(), "second expiration is a no-op");
+        eq(3, app.availableStock("A"), "inventory released exactly once");
+        eq(0, app.reservedStock("A"), "no reservation remains");
+        eq(1L, countEvents(app, "ORDER_CANCELLED"), "one cancellation event");
+    }
+
+    private static void concurrentCallbacksAndExpirationCommitOnce() {
+        ManualTime clock = new ManualTime(19_000);
+        CommerceSystem app = app(clock);
+        app.addStock("A", 1);
+        app.createOrder("O-RACE", List.of(new OrderItem("A", 1, 1_000)), null, 100);
+        clock.set(19_100);
+        ExecutorService executor = Executors.newFixedThreadPool(4);
+        try {
+            CountDownLatch start = new CountDownLatch(1);
+            Future<?> payment = executor.submit(() -> awaitAndRun(start,
+                    () -> app.paymentSucceeded("P-RACE", "O-RACE", 1_000)));
+            Future<?> duplicate = executor.submit(() -> awaitAndRun(start,
+                    () -> app.paymentSucceeded("P-RACE", "O-RACE", 1_000)));
+            Future<?> expiration = executor.submit(() -> awaitAndRun(start, app::expireDueOrders));
+            Future<?> cancellation = executor.submit(() -> awaitAndRun(start, () -> app.cancelOrder("O-RACE")));
+            start.countDown();
+            payment.get(5, TimeUnit.SECONDS);
+            duplicate.get(5, TimeUnit.SECONDS);
+            expiration.get(5, TimeUnit.SECONDS);
+            cancellation.get(5, TimeUnit.SECONDS);
+        } catch (Exception error) {
+            throw new AssertionError("concurrent scenario did not finish", error);
+        } finally {
+            executor.shutdownNow();
+        }
+        OrderStatus finalStatus = app.order("O-RACE").status();
+        check(finalStatus == OrderStatus.PAID || finalStatus == OrderStatus.CANCELLED,
+                "race ends in one committed order state");
+        int accounted = app.availableStock("A") + app.reservedStock("A") + app.soldStock("A");
+        eq(1, accounted, "inventory buckets always sum to stock");
+        long successEvents = countEvents(app, "PAYMENT_SUCCEEDED");
+        eq(finalStatus == OrderStatus.PAID ? 1L : 0L, successEvents, "success events match final state");
+    }
+
+    private static void awaitAndRun(CountDownLatch start, Runnable action) {
+        try {
+            start.await();
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted before action", error);
+        }
+        action.run();
     }
 
     private static CommerceSystem app(ManualTime clock) {

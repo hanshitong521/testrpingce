@@ -46,21 +46,20 @@ final class InventoryService {
 
     void release(String orderId) {
         Reservation reservation = store.reservations.get(orderId);
-        if (reservation == null) {
+        if (reservation == null || reservation.state != ReservationState.RESERVED) {
             return;
         }
-        // Historical code assumes a caller will only release a live reservation.
         for (Map.Entry<String, Integer> line : reservation.quantities.entrySet()) {
             InventoryRecord item = store.inventory.get(line.getKey());
             item.reserved -= line.getValue();
             item.available += line.getValue();
         }
-        reservation.state = "RELEASED";
+        reservation.state = ReservationState.RELEASED;
     }
 
     void commit(String orderId) {
         Reservation reservation = store.reservations.get(orderId);
-        if (reservation == null) {
+        if (reservation == null || reservation.state != ReservationState.RESERVED) {
             return;
         }
         for (Map.Entry<String, Integer> line : reservation.quantities.entrySet()) {
@@ -68,7 +67,7 @@ final class InventoryService {
             item.reserved -= line.getValue();
             item.sold += line.getValue();
         }
-        reservation.state = "COMMITTED";
+        reservation.state = ReservationState.COMMITTED;
     }
 
     int available(String sku) {

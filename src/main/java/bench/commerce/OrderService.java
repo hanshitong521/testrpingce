@@ -19,62 +19,75 @@ final class OrderService {
         if (orderId == null || orderId.isBlank() || items == null || items.isEmpty() || ttlMillis <= 0) {
             throw new IllegalArgumentException("invalid order request");
         }
-        if (store.orders.containsKey(orderId)) {
-            throw new IllegalArgumentException("order already exists");
+        synchronized (store.mutex) {
+            if (store.orders.containsKey(orderId)) {
+                throw new IllegalArgumentException("order already exists");
+            }
+            long subtotal = 0;
+            for (OrderItem item : items) {
+                subtotal = Math.addExact(subtotal, item.lineTotalCents());
+            }
+            long discount = coupons.reserve(couponCode, orderId, subtotal);
+            if (!inventory.reserve(orderId, items)) {
+                coupons.release(couponCode, orderId);
+                throw new IllegalStateException("insufficient inventory");
+            }
+            long now = clock.nowMillis();
+            long expiresAt = ttlMillis > Long.MAX_VALUE - now ? Long.MAX_VALUE : now + ttlMillis;
+            Order order = new Order(orderId, items, subtotal, discount, couponCode, now, expiresAt);
+            store.orders.put(orderId, order);
+            store.event(EventTypes.ORDER_CREATED, orderId, null, order.payable);
+            return order.view();
         }
-        long subtotal = 0;
-        for (OrderItem item : items) {
-            subtotal = Math.addExact(subtotal, item.lineTotalCents());
-        }
-        long discount = coupons.reserve(couponCode, orderId, subtotal);
-        if (!inventory.reserve(orderId, items)) {
-            coupons.release(couponCode, orderId);
-            throw new IllegalStateException("insufficient inventory");
-        }
-        long now = clock.nowMillis();
-        long expiresAt = ttlMillis > Long.MAX_VALUE - now ? Long.MAX_VALUE : now + ttlMillis;
-        Order order = new Order(orderId, items, subtotal, discount, couponCode, now, expiresAt);
-        store.orders.put(orderId, order);
-        store.event("ORDER_CREATED", orderId, null, order.payable);
-        return order.view();
     }
 
     boolean cancel(String orderId) {
-        Order order = store.orders.get(orderId);
-        if (order == null || order.status != OrderStatus.PENDING_PAYMENT) {
-            return false;
+        synchronized (store.mutex) {
+            Order order = store.orders.get(orderId);
+            if (order == null || !order.pendingPayment()) {
+                return false;
+            }
+            order.status = OrderStatus.CANCELLED;
+            inventory.release(orderId);
+            coupons.release(order.couponCode, orderId);
+            store.event(EventTypes.ORDER_CANCELLED, orderId, null, 0);
+            return true;
         }
-        inventory.release(orderId);
-        coupons.release(order.couponCode, orderId);
-        order.status = OrderStatus.CANCELLED;
-        store.event("ORDER_CANCELLED", orderId, null, 0);
-        return true;
     }
 
-    boolean markPaid(String orderId, long amountCents, String paymentId) {
-        Order order = store.orders.get(orderId);
-        if (order == null || order.status == OrderStatus.PAID
-                || order.status == OrderStatus.REFUNDED
-                || order.status == OrderStatus.PARTIALLY_REFUNDED) {
-            return false;
+    boolean commitPayment(String orderId, long amountCents, String paymentId) {
+        synchronized (store.mutex) {
+            Order order = store.orders.get(orderId);
+            if (order == null || !order.pendingPayment() || amountCents != order.payable) {
+                return false;
+            }
+            inventory.commit(orderId);
+            coupons.consume(order.couponCode, orderId);
+            order.status = OrderStatus.PAID;
+            order.paid = amountCents;
+            order.capturingPaymentId = paymentId;
+            store.event(EventTypes.PAYMENT_SUCCEEDED, orderId, paymentId, amountCents);
+            return true;
         }
-        if (amountCents != order.payable) {
-            return false;
+    }
+
+    boolean hasRefund(String orderId) {
+        synchronized (store.mutex) {
+            Order order = store.orders.get(orderId);
+            return order != null && order.refunded > 0;
         }
-        inventory.commit(orderId);
-        coupons.consume(order.couponCode, orderId);
-        order.status = OrderStatus.PAID;
-        order.paid = amountCents;
-        store.event("PAYMENT_SUCCEEDED", orderId, paymentId, amountCents);
-        return true;
     }
 
     Order get(String orderId) {
-        return store.orders.get(orderId);
+        synchronized (store.mutex) {
+            return store.orders.get(orderId);
+        }
     }
 
     OrderView view(String orderId) {
-        Order order = store.orders.get(orderId);
-        return order == null ? null : order.view();
+        synchronized (store.mutex) {
+            Order order = store.orders.get(orderId);
+            return order == null ? null : order.view();
+        }
     }
 }

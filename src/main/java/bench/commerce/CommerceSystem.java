@@ -4,9 +4,9 @@ import java.util.List;
 
 /** Public entry point for the legacy commerce application. */
 public final class CommerceSystem {
-    private final CommerceStore store = new CommerceStore();
-    private final InventoryService inventory = new InventoryService(store);
-    private final CouponService coupons = new CouponService(store);
+    private final CommerceStore store;
+    private final InventoryService inventory;
+    private final CouponService coupons;
     private final OrderService orders;
     private final PaymentService payments;
     private final ExpirationJob expiration;
@@ -16,6 +16,9 @@ public final class CommerceSystem {
         if (clock == null) {
             throw new IllegalArgumentException("clock is required");
         }
+        store = new CommerceStore();
+        inventory = new InventoryService(store);
+        coupons = new CouponService(store);
         orders = new OrderService(store, inventory, coupons, clock);
         payments = new PaymentService(store, orders);
         expiration = new ExpirationJob(store, orders, clock);
@@ -23,27 +26,39 @@ public final class CommerceSystem {
     }
 
     public void addStock(String sku, int quantity) {
-        inventory.addStock(sku, quantity);
+        synchronized (store.mutex) {
+            inventory.addStock(sku, quantity);
+        }
     }
 
     public int availableStock(String sku) {
-        return inventory.available(sku);
+        synchronized (store.mutex) {
+            return inventory.available(sku);
+        }
     }
 
     public int reservedStock(String sku) {
-        return inventory.reserved(sku);
+        synchronized (store.mutex) {
+            return inventory.reserved(sku);
+        }
     }
 
     public int soldStock(String sku) {
-        return inventory.sold(sku);
+        synchronized (store.mutex) {
+            return inventory.sold(sku);
+        }
     }
 
     public void addCoupon(String code, long discountCents) {
-        coupons.addCoupon(code, discountCents);
+        synchronized (store.mutex) {
+            coupons.addCoupon(code, discountCents);
+        }
     }
 
     public CouponStatus couponStatus(String code) {
-        return coupons.status(code);
+        synchronized (store.mutex) {
+            return coupons.status(code);
+        }
     }
 
     public OrderView createOrder(String orderId, List<OrderItem> items, String couponCode, long ttlMillis) {
@@ -71,6 +86,8 @@ public final class CommerceSystem {
     }
 
     public List<DomainEvent> events() {
-        return List.copyOf(store.events);
+        synchronized (store.mutex) {
+            return List.copyOf(store.events);
+        }
     }
 }

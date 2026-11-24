@@ -10,4 +10,8 @@ final class RefundRecord {
         this.orderId = orderId;
         this.amount = amount;
     }
+
+    boolean sameRequest(String orderId, long amount) {
+        return this.orderId.equals(orderId) && this.amount == amount;
+    }
 }
