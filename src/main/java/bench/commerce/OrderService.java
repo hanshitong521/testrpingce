@@ -2,6 +2,13 @@ package bench.commerce;
 
 import java.util.List;
 
+/**
+ * Order lifecycle: creation, cancellation and payment application.
+ *
+ * <p>Every state transition and its side effects (stock, coupon, audit event) happen together, so a
+ * caller must hold the store lock. The order status is the single source of truth for which
+ * transition is still allowed.
+ */
 final class OrderService {
     private final CommerceStore store;
     private final InventoryService inventory;
@@ -35,38 +42,46 @@ final class OrderService {
         long expiresAt = ttlMillis > Long.MAX_VALUE - now ? Long.MAX_VALUE : now + ttlMillis;
         Order order = new Order(orderId, items, subtotal, discount, couponCode, now, expiresAt);
         store.orders.put(orderId, order);
-        store.event("ORDER_CREATED", orderId, null, order.payable);
+        store.event(EventTypes.ORDER_CREATED, orderId, null, order.payable);
         return order.view();
     }
 
+    /** Manual cancellation. Only an order still awaiting payment may be cancelled. */
     boolean cancel(String orderId) {
         Order order = store.orders.get(orderId);
-        if (order == null || order.status != OrderStatus.PENDING_PAYMENT) {
+        return order != null && cancelPending(order);
+    }
+
+    private boolean cancelPending(Order order) {
+        if (!order.isPendingPayment()) {
             return false;
         }
-        inventory.release(orderId);
-        coupons.release(order.couponCode, orderId);
+        if (!inventory.release(order.id)) {
+            throw new IllegalStateException("order " + order.id + " has no live reservation");
+        }
+        coupons.release(order.couponCode, order.id);
         order.status = OrderStatus.CANCELLED;
-        store.event("ORDER_CANCELLED", orderId, null, 0);
+        store.event(EventTypes.ORDER_CANCELLED, order.id, null, 0);
         return true;
     }
 
-    boolean markPaid(String orderId, long amountCents, String paymentId) {
-        Order order = store.orders.get(orderId);
-        if (order == null || order.status == OrderStatus.PAID
-                || order.status == OrderStatus.REFUNDED
-                || order.status == OrderStatus.PARTIALLY_REFUNDED) {
-            return false;
+    /** Expiry shares the cancellation transition so stock and coupon are released exactly once. */
+    boolean expire(Order order, long now) {
+        return order.isPendingPayment() && now >= order.expiresAt && cancelPending(order);
+    }
+
+    /** Commits a verified payment for an order that is still awaiting payment. */
+    void completePayment(Order order, String paymentId, long amountCents) {
+        if (!order.isPendingPayment()) {
+            throw new IllegalStateException("order " + order.id + " is not awaiting payment");
         }
-        if (amountCents != order.payable) {
-            return false;
+        if (!inventory.commit(order.id)) {
+            throw new IllegalStateException("order " + order.id + " has no live reservation");
         }
-        inventory.commit(orderId);
-        coupons.consume(order.couponCode, orderId);
+        coupons.consume(order.couponCode, order.id);
         order.status = OrderStatus.PAID;
         order.paid = amountCents;
-        store.event("PAYMENT_SUCCEEDED", orderId, paymentId, amountCents);
-        return true;
+        store.event(EventTypes.PAYMENT_SUCCEEDED, order.id, paymentId, amountCents);
     }
 
     Order get(String orderId) {

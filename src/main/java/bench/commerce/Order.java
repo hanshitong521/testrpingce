@@ -28,6 +28,18 @@ final class Order {
         this.expiresAt = expiresAt;
     }
 
+    boolean isPendingPayment() {
+        return status == OrderStatus.PENDING_PAYMENT;
+    }
+
+    boolean isRefundable() {
+        return status == OrderStatus.PAID || status == OrderStatus.PARTIALLY_REFUNDED;
+    }
+
+    long remainingRefundable() {
+        return paid - refunded;
+    }
+
     OrderView view() {
         return new OrderView(id, items, subtotal, discount, payable, couponCode, status,
                 paid, refunded, createdAt, expiresAt);
