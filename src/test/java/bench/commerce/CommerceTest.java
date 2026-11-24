@@ -1,7 +1,6 @@
 package bench.commerce;
 
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public final class CommerceTest {
     private static int passed;
