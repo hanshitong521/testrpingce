@@ -62,13 +62,15 @@ public final class TaskQueue {
             throw new IllegalArgumentException("workerId must not be blank");
         }
         long now = timeSource.nowMillis();
+        reclaimExpiredLeases(now);
 
-        // TODO: Expire old leases before choosing the next eligible task.
         Entry selected = null;
         for (Entry entry : entries.values()) {
-            if (entry.status == TaskStatus.READY && entry.availableAtMillis <= now) {
+            if (entry.status != TaskStatus.READY || entry.availableAtMillis > now) {
+                continue;
+            }
+            if (selected == null || hasHigherPriority(entry, selected)) {
                 selected = entry;
-                break;
             }
         }
         if (selected == null) {
@@ -142,15 +144,41 @@ public final class TaskQueue {
             return null;
         }
         Entry entry = entries.get(claim.taskId());
-        if (entry == null || entry.status != TaskStatus.RUNNING) {
+        if (entry == null || entry.status != TaskStatus.RUNNING || entry.leaseUntilMillis == null) {
             return null;
         }
         if (!Objects.equals(entry.workerId, claim.workerId())
-                || !Objects.equals(entry.leaseToken, claim.leaseToken())) {
+                || !Objects.equals(entry.leaseToken, claim.leaseToken())
+                || entry.attempts != claim.attempt()) {
             return null;
         }
-        // TODO: A worker must not acknowledge or retry after its lease expires.
+        if (timeSource.nowMillis() >= entry.leaseUntilMillis) {
+            return null;
+        }
         return entry;
+    }
+
+    // Repairs leases that expired without being explicitly released. Exhausted
+    // tasks are dead-lettered; the rest return to the ready pool.
+    private void reclaimExpiredLeases(long now) {
+        for (Entry entry : entries.values()) {
+            if (entry.status == TaskStatus.RUNNING
+                    && entry.leaseUntilMillis != null
+                    && now >= entry.leaseUntilMillis) {
+                entry.status = entry.attempts >= maxAttempts
+                        ? TaskStatus.DEAD
+                        : TaskStatus.READY;
+                clearLease(entry);
+            }
+        }
+    }
+
+    // Earlier due time wins; tasks that share a due time keep enqueue order.
+    private static boolean hasHigherPriority(Entry candidate, Entry current) {
+        if (candidate.availableAtMillis != current.availableAtMillis) {
+            return candidate.availableAtMillis < current.availableAtMillis;
+        }
+        return candidate.sequence < current.sequence;
     }
 
     private static boolean isTerminal(TaskStatus status) {
@@ -183,7 +211,6 @@ public final class TaskQueue {
         private final String payload;
         private final String idempotencyKey;
         private final long createdAtMillis;
-        @SuppressWarnings("unused")
         private final long sequence;
         private TaskStatus status = TaskStatus.READY;
         private int attempts;
