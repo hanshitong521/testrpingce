@@ -62,13 +62,18 @@ public final class TaskQueue {
             throw new IllegalArgumentException("workerId must not be blank");
         }
         long now = timeSource.nowMillis();
+        expireLeases(now);
 
-        // TODO: Expire old leases before choosing the next eligible task.
         Entry selected = null;
         for (Entry entry : entries.values()) {
-            if (entry.status == TaskStatus.READY && entry.availableAtMillis <= now) {
+            if (entry.status != TaskStatus.READY || entry.availableAtMillis > now) {
+                continue;
+            }
+            if (selected == null
+                    || entry.availableAtMillis < selected.availableAtMillis
+                    || (entry.availableAtMillis == selected.availableAtMillis
+                        && entry.sequence < selected.sequence)) {
                 selected = entry;
-                break;
             }
         }
         if (selected == null) {
@@ -86,7 +91,7 @@ public final class TaskQueue {
 
     /** Marks a currently leased task as successful. Stale claims must be rejected. */
     public synchronized boolean acknowledge(TaskClaim claim) {
-        Entry entry = findClaimedEntry(claim);
+        Entry entry = findClaimedEntry(claim, timeSource.nowMillis());
         if (entry == null) {
             return false;
         }
@@ -103,7 +108,8 @@ public final class TaskQueue {
         if (delayMillis < 0) {
             throw new IllegalArgumentException("delayMillis must not be negative");
         }
-        Entry entry = findClaimedEntry(claim);
+        long now = timeSource.nowMillis();
+        Entry entry = findClaimedEntry(claim, now);
         if (entry == null) {
             return false;
         }
@@ -111,7 +117,7 @@ public final class TaskQueue {
             entry.status = TaskStatus.DEAD;
         } else {
             entry.status = TaskStatus.READY;
-            entry.availableAtMillis = safeAdd(timeSource.nowMillis(), delayMillis);
+            entry.availableAtMillis = safeAdd(now, delayMillis);
         }
         clearLease(entry);
         return true;
@@ -137,7 +143,7 @@ public final class TaskQueue {
         return List.copyOf(result);
     }
 
-    private Entry findClaimedEntry(TaskClaim claim) {
+    private Entry findClaimedEntry(TaskClaim claim, long now) {
         if (claim == null) {
             return null;
         }
@@ -149,8 +155,28 @@ public final class TaskQueue {
                 || !Objects.equals(entry.leaseToken, claim.leaseToken())) {
             return null;
         }
-        // TODO: A worker must not acknowledge or retry after its lease expires.
-        return entry;
+        return entry.leaseUntilMillis != null && now < entry.leaseUntilMillis ? entry : null;
+    }
+
+    /**
+     * Recovers RUNNING tasks whose lease has expired. Recovered tasks are due
+     * immediately; tasks that exhausted their attempts become DEAD.
+     */
+    private void expireLeases(long now) {
+        for (Entry entry : entries.values()) {
+            if (entry.status != TaskStatus.RUNNING
+                    || entry.leaseUntilMillis == null
+                    || now < entry.leaseUntilMillis) {
+                continue;
+            }
+            if (entry.attempts >= maxAttempts) {
+                entry.status = TaskStatus.DEAD;
+            } else {
+                entry.status = TaskStatus.READY;
+                entry.availableAtMillis = now;
+            }
+            clearLease(entry);
+        }
     }
 
     private static boolean isTerminal(TaskStatus status) {
@@ -183,7 +209,6 @@ public final class TaskQueue {
         private final String payload;
         private final String idempotencyKey;
         private final long createdAtMillis;
-        @SuppressWarnings("unused")
         private final long sequence;
         private TaskStatus status = TaskStatus.READY;
         private int attempts;
