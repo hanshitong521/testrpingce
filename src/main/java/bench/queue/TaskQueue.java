@@ -62,13 +62,18 @@ public final class TaskQueue {
             throw new IllegalArgumentException("workerId must not be blank");
         }
         long now = timeSource.nowMillis();
+        expireLeases(now);
 
-        // TODO: Expire old leases before choosing the next eligible task.
         Entry selected = null;
         for (Entry entry : entries.values()) {
-            if (entry.status == TaskStatus.READY && entry.availableAtMillis <= now) {
+            if (entry.status != TaskStatus.READY || entry.availableAtMillis > now) {
+                continue;
+            }
+            if (selected == null
+                    || entry.availableAtMillis < selected.availableAtMillis
+                    || (entry.availableAtMillis == selected.availableAtMillis
+                            && entry.sequence < selected.sequence)) {
                 selected = entry;
-                break;
             }
         }
         if (selected == null) {
@@ -149,8 +154,26 @@ public final class TaskQueue {
                 || !Objects.equals(entry.leaseToken, claim.leaseToken())) {
             return null;
         }
-        // TODO: A worker must not acknowledge or retry after its lease expires.
+        if (entry.leaseUntilMillis == null || timeSource.nowMillis() >= entry.leaseUntilMillis) {
+            return null;
+        }
         return entry;
+    }
+
+    /** Reclaims expired leases: READY when attempts remain, DEAD once exhausted. */
+    private void expireLeases(long now) {
+        for (Entry entry : entries.values()) {
+            if (entry.status == TaskStatus.RUNNING
+                    && entry.leaseUntilMillis != null
+                    && now >= entry.leaseUntilMillis) {
+                if (entry.attempts >= maxAttempts) {
+                    entry.status = TaskStatus.DEAD;
+                } else {
+                    entry.status = TaskStatus.READY;
+                }
+                clearLease(entry);
+            }
+        }
     }
 
     private static boolean isTerminal(TaskStatus status) {
@@ -183,7 +206,6 @@ public final class TaskQueue {
         private final String payload;
         private final String idempotencyKey;
         private final long createdAtMillis;
-        @SuppressWarnings("unused")
         private final long sequence;
         private TaskStatus status = TaskStatus.READY;
         private int attempts;

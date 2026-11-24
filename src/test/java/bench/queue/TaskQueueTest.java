@@ -16,13 +16,26 @@ public final class TaskQueueTest {
     }
 
     public static void main(String[] args) throws Exception {
+        run("constructor rejects invalid limits", TaskQueueTest::constructorValidation);
+        run("payload null rejected while blank keys disable idempotency",
+                TaskQueueTest::payloadAndBlankKeys);
         run("enqueue snapshot and idempotency", TaskQueueTest::enqueueAndIdempotency);
+        run("idempotency keys match exactly without trimming",
+                TaskQueueTest::idempotencyKeyExactMatch);
         run("due-time ordering and delayed retry", TaskQueueTest::orderingAndRetryDelay);
         run("earliest due time wins and ties remain FIFO", TaskQueueTest::dueTimeOrderingAndFifo);
         run("lease expiry rejects stale worker and exhausts attempts", TaskQueueTest::leaseExpiry);
+        run("expired lease rejects token before reclaim",
+                TaskQueueTest::expiredLeaseRejectedBeforeReclaim);
+        run("retry delay boundary and attempt exhaustion", TaskQueueTest::retryBoundaries);
+        run("claim validation and overflow saturation",
+                TaskQueueTest::claimValidationAndSaturation);
         run("acknowledged task is terminal", TaskQueueTest::acknowledgement);
         run("cancellation invalidates active lease", TaskQueueTest::cancellation);
+        run("cancel ready, unknown and terminal tasks", TaskQueueTest::cancelReadyAndUnknown);
+        run("snapshot list is immutable", TaskQueueTest::snapshotImmutable);
         run("concurrent claims do not duplicate tasks", TaskQueueTest::concurrentClaims);
+        run("concurrent idempotent enqueue creates one task", TaskQueueTest::concurrentIdempotentEnqueue);
         System.out.println("PASS: " + passed + " tests");
     }
 
@@ -49,6 +62,176 @@ public final class TaskQueueTest {
         equal(TaskStatus.SUCCEEDED, terminalDuplicate.status());
         equal("alpha", terminalDuplicate.payload());
         equal(3, queue.snapshotAll().size());
+    }
+
+    private static void constructorValidation() {
+        expectThrows(IllegalArgumentException.class, () -> new TaskQueue(new MutableTime(0L), 0L, 1));
+        expectThrows(IllegalArgumentException.class, () -> new TaskQueue(new MutableTime(0L), -1L, 1));
+        expectThrows(IllegalArgumentException.class, () -> new TaskQueue(new MutableTime(0L), 100L, 0));
+        expectThrows(IllegalArgumentException.class, () -> new TaskQueue(new MutableTime(0L), 100L, -1));
+        expectThrows(NullPointerException.class, () -> new TaskQueue(null, 100L, 1));
+    }
+
+    private static void payloadAndBlankKeys() {
+        MutableTime time = new MutableTime(5L);
+        TaskQueue queue = new TaskQueue(time, 100L, 2);
+        expectThrows(NullPointerException.class, () -> queue.enqueue(null, "key"));
+
+        TaskSnapshot emptyPayload = queue.enqueue("", " ");
+        TaskSnapshot emptyPayloadAgain = queue.enqueue("", "  ");
+        TaskSnapshot nullKey = queue.enqueue("null-key", null);
+        TaskSnapshot emptyKeyA = queue.enqueue("empty-key-a", "");
+        TaskSnapshot emptyKeyB = queue.enqueue("empty-key-b", "");
+
+        equal("", emptyPayload.payload());
+        equal(TaskStatus.READY, emptyPayload.status());
+        equal(0, emptyPayload.attempts());
+        equal(5L, emptyPayload.createdAtMillis());
+        equal(5L, emptyPayload.availableAtMillis());
+        notEqual(emptyPayload.id(), emptyPayloadAgain.id());
+        notEqual(emptyPayload.id(), nullKey.id());
+        notEqual(emptyKeyA.id(), emptyKeyB.id());
+        equal(5, queue.snapshotAll().size());
+    }
+
+    private static void idempotencyKeyExactMatch() {
+        MutableTime time = new MutableTime(0L);
+        TaskQueue queue = new TaskQueue(time, 100L, 2);
+        TaskSnapshot original = queue.enqueue("first", "KEY");
+        TaskSnapshot spaced = queue.enqueue("different", " KEY ");
+        TaskSnapshot duplicate = queue.enqueue("overwrite", "KEY");
+
+        notEqual(original.id(), spaced.id());
+        equal(original.id(), duplicate.id());
+        equal("first", duplicate.payload());
+        equal(TaskStatus.READY, duplicate.status());
+        equal(0, duplicate.attempts());
+
+        TaskClaim claim = queue.claimNext("worker").orElseThrow();
+        check(queue.acknowledge(claim), "original claim should acknowledge");
+        TaskSnapshot terminalDuplicate = queue.enqueue("ignored", "KEY");
+        equal(original.id(), terminalDuplicate.id());
+        equal(TaskStatus.SUCCEEDED, terminalDuplicate.status());
+        equal(1, terminalDuplicate.attempts());
+        equal("first", terminalDuplicate.payload());
+    }
+
+    private static void expiredLeaseRejectedBeforeReclaim() {
+        MutableTime time = new MutableTime(0L);
+        TaskQueue queue = new TaskQueue(time, 100L, 3);
+        TaskSnapshot task = queue.enqueue("work", null);
+        TaskClaim first = queue.claimNext("worker-1").orElseThrow();
+        equal(100L, first.leaseUntilMillis());
+
+        time.advance(100L);
+        check(!queue.acknowledge(first), "expired claim must not acknowledge");
+        check(!queue.retry(first, 0L), "expired claim must not retry");
+        TaskSnapshot untouched = queue.snapshotAll().get(0);
+        equal(TaskStatus.RUNNING, untouched.status());
+        equal(1, untouched.attempts());
+        equal(first.leaseUntilMillis(), untouched.leaseUntilMillis().longValue());
+
+        TaskClaim second = queue.claimNext("worker-2").orElseThrow();
+        equal(task.id(), second.taskId());
+        equal(2, second.attempt());
+        notEqual(first.leaseToken(), second.leaseToken());
+        check(!queue.acknowledge(first), "stale token must not acknowledge after reclaim");
+        check(!queue.retry(first, 0L), "stale token must not retry after reclaim");
+
+        MutableTime boundary = new MutableTime(0L);
+        TaskQueue beforeExpiry = new TaskQueue(boundary, 100L, 2);
+        beforeExpiry.enqueue("work", null);
+        TaskClaim active = beforeExpiry.claimNext("worker").orElseThrow();
+        boundary.advance(99L);
+        check(beforeExpiry.acknowledge(active), "lease is valid one millisecond before expiry");
+    }
+
+    private static void retryBoundaries() {
+        MutableTime time = new MutableTime(0L);
+        TaskQueue exhausted = new TaskQueue(time, 1_000L, 1);
+        exhausted.enqueue("only", null);
+        TaskClaim claim = exhausted.claimNext("worker").orElseThrow();
+        expectThrows(IllegalArgumentException.class, () -> exhausted.retry(claim, -1L));
+        check(exhausted.retry(claim, 0L), "zero delay must be accepted");
+        TaskSnapshot dead = exhausted.snapshotAll().get(0);
+        equal(TaskStatus.DEAD, dead.status());
+        equal(null, dead.leaseUntilMillis());
+        check(!exhausted.retry(claim, 0L), "dead task must reject further retries");
+        check(!exhausted.acknowledge(claim), "dead task must reject acknowledge");
+
+        TaskQueue delayed = new TaskQueue(time, 1_000L, 2);
+        TaskSnapshot task = delayed.enqueue("delayed", null);
+        TaskClaim first = delayed.claimNext("worker-a").orElseThrow();
+        check(delayed.retry(first, 25L), "retry under limit must be accepted");
+        TaskSnapshot ready = delayed.snapshotAll().get(0);
+        equal(TaskStatus.READY, ready.status());
+        equal(25L, ready.availableAtMillis());
+        equal(null, ready.leaseUntilMillis());
+        equal(1, ready.attempts());
+        check(delayed.claimNext("worker-b").isEmpty(), "task must wait for its delay");
+
+        time.advance(24L);
+        check(delayed.claimNext("worker-c").isEmpty(), "task must still be delayed at 24ms");
+        time.advance(1L);
+        TaskClaim second = delayed.claimNext("worker-d").orElseThrow();
+        equal(task.id(), second.taskId());
+        equal(2, second.attempt());
+        check(delayed.retry(second, 0L), "attempt at limit must still retry into DEAD");
+        equal(TaskStatus.DEAD, delayed.snapshotAll().get(0).status());
+    }
+
+    private static void claimValidationAndSaturation() {
+        TaskQueue queue = new TaskQueue(new MutableTime(0L), 100L, 2);
+        expectThrows(IllegalArgumentException.class, () -> queue.claimNext(null));
+        expectThrows(IllegalArgumentException.class, () -> queue.claimNext(""));
+        expectThrows(IllegalArgumentException.class, () -> queue.claimNext("   "));
+        check(queue.claimNext("worker").isEmpty(), "empty queue yields no claim");
+
+        TaskQueue saturatingLease = new TaskQueue(new MutableTime(0L), Long.MAX_VALUE, 1);
+        saturatingLease.enqueue("saturate-lease", null);
+        TaskClaim leaseClaim = saturatingLease.claimNext("worker").orElseThrow();
+        equal(Long.MAX_VALUE, leaseClaim.leaseUntilMillis());
+        check(saturatingLease.acknowledge(leaseClaim), "saturated lease should stay valid");
+
+        MutableTime time = new MutableTime(0L);
+        TaskQueue saturatingDelay = new TaskQueue(time, 100L, 2);
+        saturatingDelay.enqueue("saturate-delay", null);
+        TaskClaim delayClaim = saturatingDelay.claimNext("worker").orElseThrow();
+        check(saturatingDelay.retry(delayClaim, Long.MAX_VALUE), "huge delay should be accepted");
+        equal(Long.MAX_VALUE, saturatingDelay.snapshotAll().get(0).availableAtMillis());
+        check(saturatingDelay.claimNext("worker").isEmpty(), "saturated task is not yet due");
+        time.advance(Long.MAX_VALUE);
+        TaskClaim saturated = saturatingDelay.claimNext("worker").orElseThrow();
+        equal(Long.MAX_VALUE, saturated.leaseUntilMillis());
+    }
+
+    private static void cancelReadyAndUnknown() {
+        MutableTime time = new MutableTime(0L);
+        TaskQueue queue = new TaskQueue(time, 100L, 2);
+        TaskSnapshot ready = queue.enqueue("ready", null);
+        check(queue.cancel(ready.id()), "ready task should be cancellable");
+        TaskSnapshot cancelled = queue.snapshotAll().get(0);
+        equal(TaskStatus.CANCELLED, cancelled.status());
+        equal(null, cancelled.leaseUntilMillis());
+        check(!queue.cancel(ready.id()), "cancelled task is terminal");
+        check(!queue.cancel("missing-task"), "unknown task cannot be cancelled");
+        check(queue.claimNext("worker").isEmpty(), "cancelled task must not be claimed");
+
+        queue.enqueue("running", null);
+        TaskClaim claim = queue.claimNext("worker").orElseThrow();
+        TaskSnapshot running = queue.snapshotAll().get(1);
+        equal(TaskStatus.RUNNING, running.status());
+        equal(100L, running.leaseUntilMillis().longValue());
+    }
+
+    private static void snapshotImmutable() {
+        TaskQueue queue = new TaskQueue(new MutableTime(0L), 100L, 2);
+        queue.enqueue("payload", null);
+        List<TaskSnapshot> snapshots = queue.snapshotAll();
+        equal(1, snapshots.size());
+        expectThrows(UnsupportedOperationException.class, snapshots::clear);
+        expectThrows(UnsupportedOperationException.class,
+                () -> snapshots.add(queue.enqueue("other", null)));
     }
 
     private static void orderingAndRetryDelay() {
@@ -195,6 +378,39 @@ public final class TaskQueueTest {
         equal(taskCount, new HashSet<>(claimedIds).size());
     }
 
+    private static void concurrentIdempotentEnqueue() throws Exception {
+        final int threadCount = 8;
+        TaskQueue queue = new TaskQueue(new MutableTime(0L), 10_000L, 1);
+        Set<String> ids = ConcurrentHashMap.newKeySet();
+        CountDownLatch ready = new CountDownLatch(threadCount);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threadCount);
+        for (int i = 0; i < threadCount; i++) {
+            Thread thread = new Thread(() -> {
+                ready.countDown();
+                try {
+                    start.await();
+                    ids.add(queue.enqueue("shared-payload", "shared-key").id());
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(exception);
+                } finally {
+                    done.countDown();
+                }
+            }, "enqueuer-" + i);
+            thread.start();
+        }
+        ready.await();
+        start.countDown();
+        done.await();
+
+        equal(1, ids.size());
+        List<TaskSnapshot> snapshots = queue.snapshotAll();
+        equal(1, snapshots.size());
+        equal("shared-payload", snapshots.get(0).payload());
+        equal(0, snapshots.get(0).attempts());
+    }
+
     private static void run(String name, ThrowingRunnable test) throws Exception {
         test.run();
         passed++;
@@ -205,6 +421,19 @@ public final class TaskQueueTest {
         if (!condition) {
             throw new AssertionError(message);
         }
+    }
+
+    private static void expectThrows(Class<? extends Throwable> expected, ThrowingRunnable action) {
+        try {
+            action.run();
+        } catch (Throwable actual) {
+            if (expected.isInstance(actual)) {
+                return;
+            }
+            throw new AssertionError("expected " + expected.getSimpleName()
+                    + " but got " + actual, actual);
+        }
+        throw new AssertionError("expected " + expected.getSimpleName() + " but nothing was thrown");
     }
 
     private static void equal(Object expected, Object actual) {
